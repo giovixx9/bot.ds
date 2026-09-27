@@ -30,6 +30,12 @@ SPAM_INTERVAL_SECONDS = 6  # in questo intervallo di tempo
 SPAM_TIMEOUT_MINUTES = 5
 SPAM_KICK_AFTER = 2        # numero di volte prima del kick
 
+# Conta le parolacce rilevate per utente: {(guild_id, user_id): count}
+badword_offenses: dict[tuple, int] = {}
+BADWORD_MUTE_AFTER = 2   # alla 2a volta: mute
+BADWORD_KICK_AFTER = 3   # alla 3a volta: kick
+BADWORD_TIMEOUT_MINUTES = 5
+
 LINK_PATTERN = re.compile(r"(https?://\S+|discord\.gg/\S+|www\.\S+)", re.IGNORECASE)
 
 BAD_WORDS = {
@@ -95,16 +101,53 @@ async def handle_automod(message: discord.Message) -> bool:
             await message.delete()
         except discord.NotFound:
             pass
-        await message.channel.send(
-            f"{message.author.mention}, linguaggio non appropriato, il messaggio è stato rimosso.",
-            delete_after=6,
-        )
-        try:
-            await message.author.send(
-                f"Il tuo messaggio nel server **{message.guild.name}** è stato rimosso: linguaggio non appropriato."
+
+        key = (message.guild.id, message.author.id)
+        badword_offenses[key] = badword_offenses.get(key, 0) + 1
+        offenses = badword_offenses[key]
+
+        if offenses >= BADWORD_KICK_AFTER:
+            badword_offenses[key] = 0
+            try:
+                await message.author.send(
+                    f"Sei stato espulso dal server **{message.guild.name}** per linguaggio ripetuto non appropriato."
+                )
+            except discord.Forbidden:
+                pass
+            try:
+                await message.author.kick(reason="Linguaggio inappropriato ripetuto (automod)")
+                await message.channel.send(f"{message.author.mention} espulso per linguaggio ripetuto.", delete_after=8)
+            except discord.Forbidden:
+                pass
+        elif offenses >= BADWORD_MUTE_AFTER:
+            try:
+                await message.author.send(
+                    f"Sei stato silenziato {BADWORD_TIMEOUT_MINUTES} minuti nel server **{message.guild.name}** "
+                    "per linguaggio ripetuto non appropriato. Alla prossima volta verrai espulso."
+                )
+            except discord.Forbidden:
+                pass
+            try:
+                await message.author.timeout(timedelta(minutes=BADWORD_TIMEOUT_MINUTES), reason="Linguaggio inappropriato ripetuto (automod)")
+                await message.channel.send(
+                    f"{message.author.mention} silenziato {BADWORD_TIMEOUT_MINUTES} minuti per linguaggio ripetuto "
+                    "(prossima volta: espulsione).",
+                    delete_after=8,
+                )
+            except discord.Forbidden:
+                pass
+        else:
+            await message.channel.send(
+                f"{message.author.mention}, linguaggio non appropriato, il messaggio è stato rimosso.",
+                delete_after=6,
             )
-        except discord.Forbidden:
-            pass
+            try:
+                await message.author.send(
+                    f"Il tuo messaggio nel server **{message.guild.name}** è stato rimosso: linguaggio non appropriato. "
+                    "Se continui verrai silenziato e poi espulso."
+                )
+            except discord.Forbidden:
+                pass
         return True
 
     # Anti-spam (troppi messaggi in poco tempo)
