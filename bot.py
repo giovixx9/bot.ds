@@ -2,7 +2,7 @@ import os
 import discord
 from discord import app_commands
 from discord.ext import commands
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -11,6 +11,14 @@ intents.members = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Avvisi in memoria: {guild_id: {member_id: [ {reason, moderator, timestamp} ]}}
+# NB: si azzerano ad ogni riavvio del bot (nessun database collegato).
+warns_store: dict[int, dict[int, list[dict]]] = {}
+
+
+def get_warns(guild_id: int, member_id: int) -> list[dict]:
+    return warns_store.setdefault(guild_id, {}).setdefault(member_id, [])
 
 
 @bot.event
@@ -88,12 +96,40 @@ async def unmute(interaction: discord.Interaction, member: discord.Member):
 @app_commands.describe(member="Utente da avvisare", reason="Motivo")
 @has_mod_perms()
 async def warn(interaction: discord.Interaction, member: discord.Member, reason: str):
+    entry = {
+        "reason": reason,
+        "moderator": str(interaction.user),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
+    get_warns(interaction.guild.id, member.id).append(entry)
+
     try:
         await member.send(f"Hai ricevuto un avviso nel server **{interaction.guild.name}**.\nMotivo: {reason}")
         dm_status = "(DM inviato)"
     except discord.Forbidden:
         dm_status = "(impossibile inviare DM, DM chiuse)"
-    await interaction.response.send_message(f"{member.mention} avvisato. Motivo: {reason} {dm_status}")
+    count = len(get_warns(interaction.guild.id, member.id))
+    await interaction.response.send_message(f"{member.mention} avvisato ({count} totali). Motivo: {reason} {dm_status}")
+
+
+@bot.tree.command(name="warnings", description="Mostra gli avvisi di un utente")
+@app_commands.describe(member="Utente da controllare")
+@has_mod_perms()
+async def warnings_cmd(interaction: discord.Interaction, member: discord.Member):
+    entries = get_warns(interaction.guild.id, member.id)
+    if not entries:
+        await interaction.response.send_message(f"{member.mention} non ha avvisi.", ephemeral=True)
+        return
+    lines = [f"{i+1}. [{e['timestamp']}] {e['reason']} — da {e['moderator']}" for i, e in enumerate(entries)]
+    await interaction.response.send_message(f"Avvisi di {member.mention} ({len(entries)}):\n" + "\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="clearwarnings", description="Cancella tutti gli avvisi di un utente")
+@app_commands.describe(member="Utente da ripulire")
+@has_mod_perms()
+async def clearwarnings(interaction: discord.Interaction, member: discord.Member):
+    warns_store.setdefault(interaction.guild.id, {})[member.id] = []
+    await interaction.response.send_message(f"Avvisi di {member.mention} cancellati.")
 
 
 @bot.tree.command(name="purge", description="Elimina un numero di messaggi dal canale")
@@ -118,14 +154,82 @@ async def slowmode(interaction: discord.Interaction, seconds: int):
         await interaction.response.send_message(f"Slowmode impostato a {seconds} secondi.")
 
 
+@bot.tree.command(name="lock", description="Blocca il canale (impedisce ai membri di scrivere)")
+@app_commands.describe(reason="Motivo")
+@has_mod_perms()
+async def lock(interaction: discord.Interaction, reason: str = "Nessun motivo specificato"):
+    overwrite = interaction.channel.overwrites_for(interaction.guild.default_role)
+    overwrite.send_messages = False
+    await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=overwrite, reason=reason)
+    await interaction.response.send_message(f"🔒 Canale bloccato. Motivo: {reason}")
+
+
+@bot.tree.command(name="unlock", description="Sblocca il canale")
+@has_mod_perms()
+async def unlock(interaction: discord.Interaction):
+    overwrite = interaction.channel.overwrites_for(interaction.guild.default_role)
+    overwrite.send_messages = None
+    await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
+    await interaction.response.send_message("🔓 Canale sbloccato.")
+
+
+@bot.tree.command(name="nick", description="Cambia il nickname di un utente")
+@app_commands.describe(member="Utente", nickname="Nuovo nickname (vuoto per rimuoverlo)")
+@has_mod_perms()
+async def nick(interaction: discord.Interaction, member: discord.Member, nickname: str = ""):
+    await member.edit(nick=nickname or None)
+    if nickname:
+        await interaction.response.send_message(f"Nickname di {member.mention} cambiato in **{nickname}**.")
+    else:
+        await interaction.response.send_message(f"Nickname di {member.mention} rimosso.")
+
+
+@bot.tree.command(name="userinfo", description="Mostra informazioni su un utente")
+@app_commands.describe(member="Utente (default: te stesso)")
+async def userinfo(interaction: discord.Interaction, member: discord.Member = None):
+    member = member or interaction.user
+    embed = discord.Embed(title=str(member), color=discord.Color.blurple())
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="ID", value=member.id, inline=True)
+    embed.add_field(name="Nickname", value=member.nick or "—", inline=True)
+    embed.add_field(name="Account creato", value=member.created_at.strftime("%Y-%m-%d"), inline=True)
+    embed.add_field(name="Entrato nel server", value=member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "—", inline=True)
+    roles = [r.mention for r in member.roles if r.name != "@everyone"]
+    embed.add_field(name=f"Ruoli ({len(roles)})", value=", ".join(roles) if roles else "—", inline=False)
+    n_warns = len(get_warns(interaction.guild.id, member.id))
+    embed.add_field(name="Avvisi", value=str(n_warns), inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="serverinfo", description="Mostra informazioni sul server")
+async def serverinfo(interaction: discord.Interaction):
+    guild = interaction.guild
+    embed = discord.Embed(title=guild.name, color=discord.Color.blurple())
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(name="ID", value=guild.id, inline=True)
+    embed.add_field(name="Proprietario", value=str(guild.owner), inline=True)
+    embed.add_field(name="Creato il", value=guild.created_at.strftime("%Y-%m-%d"), inline=True)
+    embed.add_field(name="Membri", value=guild.member_count, inline=True)
+    embed.add_field(name="Canali testuali", value=len(guild.text_channels), inline=True)
+    embed.add_field(name="Canali vocali", value=len(guild.voice_channels), inline=True)
+    embed.add_field(name="Ruoli", value=len(guild.roles), inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
 @kick.error
 @ban.error
 @unban.error
 @mute.error
 @unmute.error
 @warn.error
+@warnings_cmd.error
+@clearwarnings.error
 @purge.error
 @slowmode.error
+@lock.error
+@unlock.error
+@nick.error
 async def on_mod_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
         await interaction.response.send_message("Non hai i permessi per usare questo comando.", ephemeral=True)
