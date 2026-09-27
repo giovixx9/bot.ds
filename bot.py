@@ -31,6 +31,17 @@ async def on_ready():
     print(f"Bot online come {bot.user}")
 
 
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if bot.user in message.mentions:
+        await message.reply(
+            "Ciao! Sono gxbot, bot di moderazione. Scrivi `/` per vedere tutti i comandi disponibili."
+        )
+    await bot.process_commands(message)
+
+
 def has_mod_perms():
     async def predicate(interaction: discord.Interaction) -> bool:
         return interaction.user.guild_permissions.moderate_members
