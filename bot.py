@@ -1,4 +1,6 @@
 import os
+import re
+import time
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -16,6 +18,35 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # NB: si azzerano ad ogni riavvio del bot (nessun database collegato).
 warns_store: dict[int, dict[int, list[dict]]] = {}
 
+# Auto-moderazione: attiva di default su ogni server. {guild_id: bool}
+automod_enabled: dict[int, bool] = {}
+
+# Traccia i timestamp degli ultimi messaggi per rilevare lo spam: {(guild_id, user_id): [timestamps]}
+spam_tracker: dict[tuple, list] = {}
+# Conta quante volte un utente è stato beccato a spammare: {(guild_id, user_id): count}
+spam_offenses: dict[tuple, int] = {}
+SPAM_MAX_MESSAGES = 5      # messaggi
+SPAM_INTERVAL_SECONDS = 6  # in questo intervallo di tempo
+SPAM_TIMEOUT_MINUTES = 5
+SPAM_KICK_AFTER = 2        # numero di volte prima del kick
+
+LINK_PATTERN = re.compile(r"(https?://\S+|discord\.gg/\S+|www\.\S+)", re.IGNORECASE)
+
+BAD_WORDS = {
+    "cazzo", "stronzo", "stronza", "merda", "puttana", "troia",
+    "bastardo", "coglione", "vaffanculo", "figadituamadre",
+}
+
+
+def is_automod_on(guild_id: int) -> bool:
+    return automod_enabled.get(guild_id, True)
+
+
+def contains_bad_word(text: str) -> bool:
+    lowered = text.lower()
+    words = re.findall(r"[a-zàèéìòù]+", lowered)
+    return any(w in BAD_WORDS for w in words)
+
 
 def get_warns(guild_id: int, member_id: int) -> list[dict]:
     return warns_store.setdefault(guild_id, {}).setdefault(member_id, [])
@@ -31,10 +62,111 @@ async def on_ready():
     print(f"Bot online come {bot.user}")
 
 
+async def handle_automod(message: discord.Message) -> bool:
+    """Ritorna True se il messaggio è stato rimosso dall'automod."""
+    if not message.guild or not is_automod_on(message.guild.id):
+        return False
+    if message.author.guild_permissions.manage_messages:
+        return False  # i moderatori non sono soggetti all'automod
+
+    content = message.content or ""
+
+    # Anti-link
+    if LINK_PATTERN.search(content):
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass
+        await message.channel.send(
+            f"{message.author.mention}, i link non sono permessi in questo server.",
+            delete_after=6,
+        )
+        try:
+            await message.author.send(
+                f"Il tuo messaggio nel server **{message.guild.name}** è stato rimosso: i link non sono permessi."
+            )
+        except discord.Forbidden:
+            pass
+        return True
+
+    # Filtro parolacce
+    if contains_bad_word(content):
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass
+        await message.channel.send(
+            f"{message.author.mention}, linguaggio non appropriato, il messaggio è stato rimosso.",
+            delete_after=6,
+        )
+        try:
+            await message.author.send(
+                f"Il tuo messaggio nel server **{message.guild.name}** è stato rimosso: linguaggio non appropriato."
+            )
+        except discord.Forbidden:
+            pass
+        return True
+
+    # Anti-spam (troppi messaggi in poco tempo)
+    key = (message.guild.id, message.author.id)
+    now = time.time()
+    timestamps = [t for t in spam_tracker.get(key, []) if now - t < SPAM_INTERVAL_SECONDS]
+    timestamps.append(now)
+    spam_tracker[key] = timestamps
+
+    if len(timestamps) > SPAM_MAX_MESSAGES:
+        spam_tracker[key] = []
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass
+
+        spam_offenses[key] = spam_offenses.get(key, 0) + 1
+        offenses = spam_offenses[key]
+
+        try:
+            if offenses >= SPAM_KICK_AFTER:
+                spam_offenses[key] = 0
+                try:
+                    await message.author.send(
+                        f"Sei stato espulso dal server **{message.guild.name}** per spam ripetuto."
+                    )
+                except discord.Forbidden:
+                    pass
+                await message.author.kick(reason="Spam ripetuto rilevato dall'automod")
+                await message.channel.send(
+                    f"{message.author.mention} espulso per spam ripetuto.",
+                    delete_after=8,
+                )
+            else:
+                try:
+                    await message.author.send(
+                        f"Sei stato silenziato {SPAM_TIMEOUT_MINUTES} minuti nel server **{message.guild.name}** per spam. "
+                        "Alla prossima volta verrai espulso."
+                    )
+                except discord.Forbidden:
+                    pass
+                await message.author.timeout(timedelta(minutes=SPAM_TIMEOUT_MINUTES), reason="Spam rilevato dall'automod")
+                await message.channel.send(
+                    f"{message.author.mention} silenziato {SPAM_TIMEOUT_MINUTES} minuti per spam "
+                    f"(prossima volta: espulsione).",
+                    delete_after=8,
+                )
+        except discord.Forbidden:
+            pass
+        return True
+
+    return False
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    if await handle_automod(message):
+        return
+
     if bot.user in message.mentions:
         await message.reply(
             "Ciao! Sono gxbot, bot di moderazione. Scrivi `/` per vedere tutti i comandi disponibili."
@@ -48,6 +180,19 @@ def has_mod_perms():
             return True
         return interaction.user.guild_permissions.moderate_members
     return app_commands.check(predicate)
+
+
+@bot.tree.command(name="automod", description="Attiva o disattiva l'auto-moderazione (anti-spam/link/parolacce)")
+@app_commands.describe(stato="on per attivare, off per disattivare")
+@app_commands.choices(stato=[
+    app_commands.Choice(name="on", value="on"),
+    app_commands.Choice(name="off", value="off"),
+])
+@has_mod_perms()
+async def automod(interaction: discord.Interaction, stato: app_commands.Choice[str]):
+    automod_enabled[interaction.guild.id] = (stato.value == "on")
+    emoji = "✅" if stato.value == "on" else "🚫"
+    await interaction.response.send_message(f"{emoji} Auto-moderazione {'attivata' if stato.value == 'on' else 'disattivata'}.")
 
 
 @bot.tree.command(name="kick", description="Espelle un utente dal server")
@@ -231,6 +376,7 @@ async def serverinfo(interaction: discord.Interaction):
 
 
 @kick.error
+@automod.error
 @ban.error
 @unban.error
 @mute.error
