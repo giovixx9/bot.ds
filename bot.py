@@ -44,6 +44,8 @@ async def on_message(message: discord.Message):
 
 def has_mod_perms():
     async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.user.id == interaction.guild.owner_id:
+            return True
         return interaction.user.guild_permissions.moderate_members
     return app_commands.check(predicate)
 
